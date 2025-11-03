@@ -27,11 +27,9 @@ app.get('/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
 
 app.all('/api/pocket/postback', async (req, res) => {
   try {
-    if ((req.query.secret || req.body?.secret) !== SECRET) {
-      return res.status(403).json({ ok: false, error: 'bad_secret' });
-    }
+     
     const payload = { ...(req.method === 'GET' ? req.query : req.body) };
-    if (ACCEPT_A.length && !ACCEPT_A.includes(String(payload.a || ''))) {
+    f (ACCEPT_A.length && !ACCEPT_A.includes(String(payload.a || ''))) {
       return res.status(202).json({ ok: true, ignored: 'affiliate' });
     }
     if (ACCEPT_AC.length && !ACCEPT_AC.includes(String(payload.ac || ''))) {
