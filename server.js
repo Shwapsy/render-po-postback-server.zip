@@ -1,71 +1,100 @@
-import 'dotenv/config';
 import express from 'express';
-import mongoose from 'mongoose';
 import morgan from 'morgan';
 import cors from 'cors';
-import { User } from './models.js';
+import bodyParser from 'body-parser';
+import { MongoClient } from 'mongodb';
+
+const {
+  MONGODB_URI,
+  MONGODB_DB = 'pocketoption_bot',
+  MONGODB_COLLECTION = 'postbacks',
+  PO_POSTBACK_SECRET,
+  PORT = 10000,
+} = process.env;
+
+if (!MONGODB_URI) {
+  console.error('MONGODB_URI is required');
+  process.exit(1);
+}
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '1mb' }));
-app.use(express.urlencoded({ extended: true }));
-app.use(morgan('tiny'));
+app.use(morgan('dev'));
+app.use(bodyParser.json({ limit: '1mb' }));
+app.use(bodyParser.urlencoded({ extended: true }));
 
-const PORT = process.env.PORT || 10000;
-const MONGODB_URI = process.env.MONGODB_URI;
-const SECRET = process.env.PO_POSTBACK_SECRET || 'change-me';
-const ACCEPT_A = (process.env.PO_ACCEPT_AFFILIATES || '').split(',').map(s=>s.trim()).filter(Boolean);
-const ACCEPT_AC = (process.env.PO_ACCEPT_CAMPAIGNS || '').split(',').map(s=>s.trim()).filter(Boolean);
+const client = new MongoClient(MONGODB_URI);
+let col;
+async function initDb() {
+  await client.connect();
+  const db = client.db(MONGODB_DB);
+  col = db.collection(MONGODB_COLLECTION);
+  await col.createIndex({ trader_id: 1 });
+  await col.createIndex({ click_id: 1 });
+  await col.createIndex({ createdAt: -1 });
+  console.log('Connected to MongoDB. Using', `${MONGODB_DB}.${MONGODB_COLLECTION}`);
+}
+initDb().catch(err => {
+  console.error('Failed to connect MongoDB', err);
+  process.exit(1);
+});
 
-if (!MONGODB_URI) { console.error('MONGODB_URI missing'); process.exit(1); }
+function toBool(v) {
+  if (typeof v === 'boolean') return v;
+  if (v == null) return false;
+  const s = String(v).toLowerCase();
+  return s === '1' || s === 'true' || s === 'yes' || s === 'y';
+}
+function toNum(v) {
+  if (v == null || v === '') return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
 
-await mongoose.connect(MONGODB_URI);
-console.log('Connected to MongoDB');
-
-app.get('/', (_req, res) => res.send('PocketOption postback server OK'));
-app.get('/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
+app.get('/', (req, res) => {
+  res.json({ ok: true, service: 'po-postback-server', db: `${MONGODB_DB}.${MONGODB_COLLECTION}` });
+});
 
 app.all('/api/pocket/postback', async (req, res) => {
   try {
-     
-    const payload = { ...(req.method === 'GET' ? req.query : req.body) };
-    f (ACCEPT_A.length && !ACCEPT_A.includes(String(payload.a || ''))) {
-      return res.status(202).json({ ok: true, ignored: 'affiliate' });
-    }
-    if (ACCEPT_AC.length && !ACCEPT_AC.includes(String(payload.ac || ''))) {
-      return res.status(202).json({ ok: true, ignored: 'campaign' });
-    }
-    const trader_id = String(payload.trader_id || '').trim();
-    if (!trader_id) return res.status(400).json({ ok: false, error: 'missing_trader_id' });
-
-    const reg  = String(payload.reg || 'false') === 'true';
-    const conf = String(payload.conf || 'false') === 'true';
-    const ftd  = String(payload.ftd || 'false') === 'true';
-    const dep  = String(payload.dep || 'false') === 'true';
-    const sumdep = Number(payload.sumdep || 0) || 0;
-    const totaldep = Number(payload.totaldep || 0) || 0;
-
-    const update = {
-      $setOnInsert: { trader_id },
-      $set: {
-        lastEvent: ftd ? 'ftd' : (dep ? 'dep' : (conf ? 'conf' : (reg ? 'reg' : 'unknown'))),
-        lastPostbackAt: new Date(),
-        lastRaw: payload
+    const payload = req.method === 'GET' ? req.query : req.body;
+    if (PO_POSTBACK_SECRET) {
+      const provided = payload.secret || req.query?.secret;
+      if (provided !== PO_POSTBACK_SECRET) {
+        return res.status(401).json({ ok: false, error: 'bad_secret' });
       }
-    };
-    if (reg) update.$set.registeredByLink = true;
-    if (conf) update.$set.emailConfirmed = true;
-    if (ftd || dep) update.$set.hasDeposit = true;
-    if (ftd && !update.$set.ftdAt) update.$set.ftdAt = new Date();
-    if (sumdep) update.$set.lastDepositAmount = sumdep;
-    if (totaldep) update.$set.totalDeposits = totaldep;
+    }
 
-    await User.updateOne({ trader_id }, update, { upsert: true });
-    return res.json({ ok: true });
-  } catch (e) {
-    console.error('postback error:', e);
-    return res.status(500).json({ ok: false, error: 'internal' });
+    const doc = {
+      click_id: payload.click_id || payload.clickId || null,
+      site_id: payload.site_id || payload.siteId || null,
+      trader_id: payload.trader_id || payload.traderId || null,
+      sumdep: toNum(payload.sumdep),
+      totaldep: toNum(payload.totaldep),
+      reg: toBool(payload.reg),
+      conf: toBool(payload.conf),
+      ftd: toBool(payload.ftd),
+      dep: toBool(payload.dep),
+      a: payload.a ?? null,
+      ac: payload.ac ?? null,
+      event: 'unknown',
+      createdAt: new Date(),
+      raw: payload,
+    };
+    if (doc.reg) doc.event = 'reg';
+    else if (doc.conf) doc.event = 'conf';
+    else if (doc.ftd) doc.event = 'ftd';
+    else if (doc.dep) doc.event = 'dep';
+
+    const result = await col.insertOne(doc);
+    return res.json({ ok: true, id: result.insertedId });
+  } catch (err) {
+    console.error('postback_error', err);
+    return res.status(500).json({ ok: false, error: 'server_error' });
   }
 });
 
-app.listen(PORT, () => console.log(`Listening on :${PORT}`));
+const server = app.listen(Number(PORT), () => {
+  console.log(`Listening on http://0.0.0.0:${PORT}`);
+});
+process.on('SIGTERM', () => server.close(() => process.exit(0)));
